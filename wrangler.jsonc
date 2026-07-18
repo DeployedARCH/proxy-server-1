@@ -1,0 +1,9 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "basement-stream-proxy-worker",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-18",
+  "observability": {
+    "enabled": true
+  }
+}
