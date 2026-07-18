@@ -6,8 +6,19 @@ const MANIFEST_CONTENT_TYPES = [
 
 const DEFAULT_REQUEST_HEADERS = {
   Accept: "*/*",
+  "Accept-Language": "en-US,en;q=0.9",
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+};
+
+const BROWSER_FETCH_HEADERS = {
+  Accept: "application/json, text/plain, */*",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Cache-Control": "no-cache",
+  Pragma: "no-cache",
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "cross-site",
 };
 
 const CORS_HEADERS = {
@@ -180,6 +191,62 @@ function makeGenericRequestHeaders(configuredHeaders) {
   return headers;
 }
 
+function deleteHeaderCaseInsensitive(headers, headerName) {
+  for (const key of [...headers.keys()]) {
+    if (key.toLowerCase() === headerName.toLowerCase()) headers.delete(key);
+  }
+}
+
+function makeGenericRequestHeaderVariants(configuredHeaders) {
+  const baseHeaders = makeGenericRequestHeaders(configuredHeaders);
+  const browserHeaders = makeGenericRequestHeaders({
+    ...BROWSER_FETCH_HEADERS,
+    ...(configuredHeaders ?? {}),
+  });
+  const extensionLikeHeaders = new Headers(browserHeaders);
+
+  deleteHeaderCaseInsensitive(extensionLikeHeaders, "Origin");
+  deleteHeaderCaseInsensitive(extensionLikeHeaders, "Referer");
+
+  const variants = [baseHeaders, browserHeaders, extensionLikeHeaders];
+  const seen = new Set();
+
+  return variants.filter((headers) => {
+    const key = JSON.stringify([...headers.entries()].sort());
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function fetchWithHeaderFallbacks(targetUrl, request, configuredHeaders) {
+  const method = request.method.toUpperCase();
+  const body = method === "GET" || method === "HEAD" ? undefined : request.body;
+  const variants =
+    body === undefined
+      ? makeGenericRequestHeaderVariants(configuredHeaders)
+      : [makeGenericRequestHeaders(configuredHeaders)];
+  let lastResponse = null;
+
+  for (const headers of variants) {
+    const response = await fetch(targetUrl, {
+      method,
+      headers,
+      body,
+      redirect: "follow",
+    });
+
+    if (response.status !== 403 && response.status !== 429) {
+      return response;
+    }
+
+    lastResponse?.body?.cancel?.();
+    lastResponse = response;
+  }
+
+  return lastResponse;
+}
+
 async function proxyRequest(request) {
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -202,12 +269,11 @@ async function proxyRequest(request) {
 
   const configuredHeaders = parseHeaders(requestUrl.searchParams.get("headers"));
   const method = request.method.toUpperCase();
-  const upstream = await fetch(targetUrl, {
-    method,
-    headers: makeGenericRequestHeaders(configuredHeaders),
-    body: method === "GET" || method === "HEAD" ? undefined : request.body,
-    redirect: "follow",
-  });
+  const upstream = await fetchWithHeaderFallbacks(
+    targetUrl,
+    request,
+    configuredHeaders,
+  );
 
   return new Response(method === "HEAD" ? null : upstream.body, {
     status: upstream.status,
