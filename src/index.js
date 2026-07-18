@@ -23,7 +23,7 @@ const BROWSER_FETCH_HEADERS = {
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "*",
   "Access-Control-Expose-Headers":
     "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified",
