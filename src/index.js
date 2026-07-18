@@ -166,6 +166,56 @@ function makeResponseHeaders(upstream, manifest) {
   return headers;
 }
 
+function getTargetParam(url) {
+  return url.searchParams.get("destination") || url.searchParams.get("url");
+}
+
+function makeGenericRequestHeaders(configuredHeaders) {
+  const headers = new Headers(DEFAULT_REQUEST_HEADERS);
+
+  for (const [key, value] of Object.entries(configuredHeaders ?? {})) {
+    if (value != null && value !== "") headers.set(key, String(value));
+  }
+
+  return headers;
+}
+
+async function proxyRequest(request) {
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
+  const requestUrl = new URL(request.url);
+  const targetUrl = getTargetParam(requestUrl);
+  if (!targetUrl) return text("Missing destination", { status: 400 });
+
+  let parsedTarget;
+  try {
+    parsedTarget = new URL(targetUrl);
+  } catch {
+    return text("Invalid destination", { status: 400 });
+  }
+
+  if (parsedTarget.protocol !== "http:" && parsedTarget.protocol !== "https:") {
+    return text("Unsupported protocol", { status: 400 });
+  }
+
+  const configuredHeaders = parseHeaders(requestUrl.searchParams.get("headers"));
+  const method = request.method.toUpperCase();
+  const upstream = await fetch(targetUrl, {
+    method,
+    headers: makeGenericRequestHeaders(configuredHeaders),
+    body: method === "GET" || method === "HEAD" ? undefined : request.body,
+    redirect: "follow",
+  });
+
+  return new Response(method === "HEAD" ? null : upstream.body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: makeResponseHeaders(upstream, false),
+  });
+}
+
 async function proxyStream(request) {
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -176,7 +226,7 @@ async function proxyStream(request) {
   }
 
   const requestUrl = new URL(request.url);
-  const targetUrl = requestUrl.searchParams.get("url");
+  const targetUrl = getTargetParam(requestUrl);
   if (!targetUrl) return text("Missing url", { status: 400 });
 
   let parsedTarget;
@@ -221,7 +271,12 @@ async function proxyStream(request) {
     }
 
     return new Response(
-      rewriteManifest(bodyText, upstream.url || targetUrl, requestUrl, configuredHeaders),
+      rewriteManifest(
+        bodyText,
+        upstream.url || targetUrl,
+        requestUrl,
+        configuredHeaders,
+      ),
       {
         status: upstream.status,
         statusText: upstream.statusText,
@@ -248,6 +303,14 @@ export default {
     if (url.pathname === "/api/stream") {
       try {
         return await proxyStream(request);
+      } catch (error) {
+        return text(error?.message || "Proxy failed", { status: 502 });
+      }
+    }
+
+    if (url.pathname === "/api/request") {
+      try {
+        return await proxyRequest(request);
       } catch (error) {
         return text(error?.message || "Proxy failed", { status: 502 });
       }
