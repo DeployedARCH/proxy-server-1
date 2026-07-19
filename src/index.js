@@ -197,6 +197,12 @@ function deleteHeaderCaseInsensitive(headers, headerName) {
   }
 }
 
+function hasHeaderCaseInsensitive(headers, headerName) {
+  return Object.keys(headers ?? {}).some(
+    (key) => key.toLowerCase() === headerName.toLowerCase(),
+  );
+}
+
 function makeGenericRequestHeaderVariants(configuredHeaders) {
   const baseHeaders = makeGenericRequestHeaders(configuredHeaders);
   const browserHeaders = makeGenericRequestHeaders({
@@ -219,20 +225,22 @@ function makeGenericRequestHeaderVariants(configuredHeaders) {
   });
 }
 
-async function fetchWithHeaderFallbacks(targetUrl, request, configuredHeaders) {
+async function fetchWithHeaderFallbacks(
+  targetUrl,
+  request,
+  configuredHeaders,
+  body,
+) {
   const method = request.method.toUpperCase();
-  const body = method === "GET" || method === "HEAD" ? undefined : request.body;
-  const variants =
-    body === undefined
-      ? makeGenericRequestHeaderVariants(configuredHeaders)
-      : [makeGenericRequestHeaders(configuredHeaders)];
+  const requestBody = method === "GET" || method === "HEAD" ? undefined : body;
+  const variants = makeGenericRequestHeaderVariants(configuredHeaders);
   let lastResponse = null;
 
   for (const headers of variants) {
     const response = await fetch(targetUrl, {
       method,
       headers,
-      body,
+      body: requestBody,
       redirect: "follow",
     });
 
@@ -269,10 +277,24 @@ async function proxyRequest(request) {
 
   const configuredHeaders = parseHeaders(requestUrl.searchParams.get("headers"));
   const method = request.method.toUpperCase();
+  const contentType = request.headers.get("Content-Type");
+  if (
+    contentType &&
+    method !== "GET" &&
+    method !== "HEAD" &&
+    !hasHeaderCaseInsensitive(configuredHeaders, "Content-Type")
+  ) {
+    configuredHeaders["Content-Type"] = contentType;
+  }
+  const body =
+    method === "GET" || method === "HEAD"
+      ? undefined
+      : await request.arrayBuffer();
   const upstream = await fetchWithHeaderFallbacks(
     targetUrl,
     request,
     configuredHeaders,
+    body,
   );
 
   return new Response(method === "HEAD" ? null : upstream.body, {
