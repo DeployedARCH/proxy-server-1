@@ -25,9 +25,13 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "*",
+  "Access-Control-Allow-Credentials": "true",
   "Access-Control-Expose-Headers":
     "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified",
 };
+
+const COOKIE_JAR_NAME = "__basement_proxy_cookie_jar";
+const MAX_COOKIE_JAR_AGE = 60 * 60 * 6;
 
 function json(data, init = {}) {
   return new Response(JSON.stringify(data), {
@@ -51,6 +55,13 @@ function text(body, init = {}) {
   });
 }
 
+function makeCorsHeaders(request) {
+  return {
+    ...CORS_HEADERS,
+    "Access-Control-Allow-Origin": request.headers.get("Origin") || "*",
+  };
+}
+
 function parseHeaders(input) {
   if (!input) return {};
   try {
@@ -59,6 +70,104 @@ function parseHeaders(input) {
   } catch {
     return {};
   }
+}
+
+function encodeBase64Url(input) {
+  const bytes = new TextEncoder().encode(input);
+  let binary = "";
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function decodeBase64Url(input) {
+  const normalized = input.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = `${normalized}${"=".repeat((4 - (normalized.length % 4)) % 4)}`;
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function parseRequestCookies(value) {
+  return Object.fromEntries(
+    (value ?? "")
+      .split(";")
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((entry) => {
+        const separatorIndex = entry.indexOf("=");
+        if (separatorIndex === -1) return [entry, ""];
+        return [
+          entry.slice(0, separatorIndex),
+          entry.slice(separatorIndex + 1),
+        ];
+      }),
+  );
+}
+
+function readCookieJar(request) {
+  const cookie = parseRequestCookies(request.headers.get("Cookie"));
+  const encoded = cookie[COOKIE_JAR_NAME];
+  if (!encoded) return {};
+
+  try {
+    const parsed = JSON.parse(decodeBase64Url(encoded));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function serializeCookieJar(jar) {
+  return `${COOKIE_JAR_NAME}=${encodeBase64Url(JSON.stringify(jar))}; Path=/; Max-Age=${MAX_COOKIE_JAR_AGE}; SameSite=None; Secure; HttpOnly`;
+}
+
+function splitSetCookieHeader(value) {
+  if (!value) return [];
+  return value.split(/,(?=\s*[^;,=\s]+=[^;]+)/g).map((item) => item.trim());
+}
+
+function getSetCookieHeaders(headers) {
+  if (typeof headers.getSetCookie === "function") {
+    return headers.getSetCookie();
+  }
+  return splitSetCookieHeader(headers.get("set-cookie"));
+}
+
+function mergeCookieHeader(existing, additions) {
+  const cookies = new Map();
+  for (const entry of splitSetCookieHeader(existing).join(";").split(";")) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const separatorIndex = trimmed.indexOf("=");
+    if (separatorIndex === -1) continue;
+    cookies.set(trimmed.slice(0, separatorIndex), trimmed.slice(separatorIndex + 1));
+  }
+
+  for (const cookie of additions) {
+    const pair = cookie.split(";", 1)[0]?.trim();
+    if (!pair) continue;
+    const separatorIndex = pair.indexOf("=");
+    if (separatorIndex === -1) continue;
+    const name = pair.slice(0, separatorIndex);
+    const value = pair.slice(separatorIndex + 1);
+    if (/;\s*max-age=0(?:;|$)/i.test(cookie)) {
+      cookies.delete(name);
+    } else {
+      cookies.set(name, value);
+    }
+  }
+
+  return [...cookies.entries()]
+    .map(([name, value]) => `${name}=${value}`)
+    .join("; ");
 }
 
 function isManifestUrl(url) {
@@ -152,8 +261,8 @@ function makeUpstreamHeaders(request, configuredHeaders) {
   return headers;
 }
 
-function makeResponseHeaders(upstream, manifest) {
-  const headers = new Headers(CORS_HEADERS);
+function makeResponseHeaders(upstream, manifest, request) {
+  const headers = new Headers(makeCorsHeaders(request));
 
   upstream.headers.forEach((value, key) => {
     const normalized = key.toLowerCase();
@@ -161,7 +270,8 @@ function makeResponseHeaders(upstream, manifest) {
       normalized === "content-encoding" ||
       normalized === "transfer-encoding" ||
       normalized === "access-control-allow-origin" ||
-      normalized === "access-control-expose-headers"
+      normalized === "access-control-expose-headers" ||
+      normalized === "set-cookie"
     ) {
       return;
     }
@@ -189,6 +299,14 @@ function makeGenericRequestHeaders(configuredHeaders) {
   }
 
   return headers;
+}
+
+function attachCookieJar(headers, cookieJar, targetHost) {
+  if (hasHeaderCaseInsensitive(Object.fromEntries(headers.entries()), "Cookie")) {
+    return;
+  }
+  const cookie = cookieJar[targetHost];
+  if (cookie) headers.set("Cookie", cookie);
 }
 
 function deleteHeaderCaseInsensitive(headers, headerName) {
@@ -230,6 +348,8 @@ async function fetchWithHeaderFallbacks(
   request,
   configuredHeaders,
   body,
+  cookieJar,
+  targetHost,
 ) {
   const method = request.method.toUpperCase();
   const requestBody = method === "GET" || method === "HEAD" ? undefined : body;
@@ -237,6 +357,7 @@ async function fetchWithHeaderFallbacks(
   let lastResponse = null;
 
   for (const headers of variants) {
+    attachCookieJar(headers, cookieJar, targetHost);
     const response = await fetch(targetUrl, {
       method,
       headers,
@@ -257,7 +378,7 @@ async function fetchWithHeaderFallbacks(
 
 async function proxyRequest(request) {
   if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: CORS_HEADERS });
+    return new Response(null, { status: 204, headers: makeCorsHeaders(request) });
   }
 
   const requestUrl = new URL(request.url);
@@ -277,6 +398,8 @@ async function proxyRequest(request) {
 
   const configuredHeaders = parseHeaders(requestUrl.searchParams.get("headers"));
   const method = request.method.toUpperCase();
+  const cookieJar = readCookieJar(request);
+  const targetHost = parsedTarget.hostname;
   const contentType = request.headers.get("Content-Type");
   if (
     contentType &&
@@ -295,18 +418,28 @@ async function proxyRequest(request) {
     request,
     configuredHeaders,
     body,
+    cookieJar,
+    targetHost,
   );
+  const upstreamCookies = getSetCookieHeaders(upstream.headers);
+  if (upstreamCookies.length > 0) {
+    cookieJar[targetHost] = mergeCookieHeader(cookieJar[targetHost], upstreamCookies);
+  }
+  const responseHeaders = makeResponseHeaders(upstream, false, request);
+  if (upstreamCookies.length > 0) {
+    responseHeaders.append("Set-Cookie", serializeCookieJar(cookieJar));
+  }
 
   return new Response(method === "HEAD" ? null : upstream.body, {
     status: upstream.status,
     statusText: upstream.statusText,
-    headers: makeResponseHeaders(upstream, false),
+    headers: responseHeaders,
   });
 }
 
 async function proxyStream(request) {
   if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: CORS_HEADERS });
+    return new Response(null, { status: 204, headers: makeCorsHeaders(request) });
   }
 
   if (request.method !== "GET" && request.method !== "HEAD") {
@@ -330,6 +463,8 @@ async function proxyStream(request) {
 
   const configuredHeaders = parseHeaders(requestUrl.searchParams.get("headers"));
   const upstreamHeaders = makeUpstreamHeaders(request, configuredHeaders);
+  const cookieJar = readCookieJar(request);
+  attachCookieJar(upstreamHeaders, cookieJar, parsedTarget.hostname);
 
   const upstream = await fetch(targetUrl, {
     method: request.method === "HEAD" ? "HEAD" : "GET",
@@ -342,7 +477,7 @@ async function proxyStream(request) {
     return new Response(null, {
       status: upstream.status,
       statusText: upstream.statusText,
-      headers: makeResponseHeaders(upstream, manifest),
+      headers: makeResponseHeaders(upstream, manifest, request),
     });
   }
 
@@ -368,7 +503,7 @@ async function proxyStream(request) {
       {
         status: upstream.status,
         statusText: upstream.statusText,
-        headers: makeResponseHeaders(upstream, true),
+        headers: makeResponseHeaders(upstream, true, request),
       },
     );
   }
@@ -376,7 +511,7 @@ async function proxyStream(request) {
   return new Response(upstream.body, {
     status: upstream.status,
     statusText: upstream.statusText,
-    headers: makeResponseHeaders(upstream, false),
+    headers: makeResponseHeaders(upstream, false, request),
   });
 }
 
